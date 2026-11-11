@@ -1,0 +1,7 @@
+torch
+transformers>=4.45
+sentence-transformers>=3.0
+chromadb>=0.5
+pypdf
+gradio>=4.0
+accelerate

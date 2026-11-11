@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.chroma/
+data/
+*.log
+.DS_Store
+colab_run.ipynb
+
+space/
+app_preview.log
+results_eval.log

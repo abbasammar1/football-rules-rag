@@ -1,0 +1,12 @@
+{
+  "run": "Google Colab, T4 GPU, Qwen2.5-3B-Instruct, greedy decoding, 2026-11-10",
+  "fixed": {
+    "fact": {"answers": "19/20", "retrieval": "18/18"},
+    "situation": {"answers": "6/10", "retrieval": "8/10"}
+  },
+  "note": "section fact score corrected 18->17 after manual review (goal-kick question was a false pass)",
+  "section": {
+    "fact": {"answers": "17/20", "retrieval": "18/18"},
+    "situation": {"answers": "7/10", "retrieval": "9/10"}
+  }
+}
