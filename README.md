@@ -5,6 +5,10 @@ with the page it came from. If the rulebook doesn't cover it ("Who won the 2022 
 questions about the Laws of the Game, instead of guessing.
 
 
+
+https://github.com/user-attachments/assets/d34e0806-446e-427a-a97c-6ca1c006c1e5
+
+
 Built with open-source models only (no paid APIs), using retrieval-augmented generation (RAG).
 
 ## How it works
