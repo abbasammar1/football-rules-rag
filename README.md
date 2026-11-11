@@ -4,7 +4,6 @@ Ask a question about the football **Laws of the Game 2026/27** and get an answer
 with the page it came from. If the rulebook doesn't cover it ("Who won the 2022 World Cup?"), it politely says it only answers
 questions about the Laws of the Game, instead of guessing.
 
-![Demo](assets/demo.gif)
 
 Built with open-source models only (no paid APIs), using retrieval-augmented generation (RAG).
 
