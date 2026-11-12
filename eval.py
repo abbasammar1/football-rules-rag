@@ -1,8 +1,11 @@
-"""Evaluate the assistant on 30 questions with known answers from the 2026/27 rulebook.
+"""Evaluate the assistant on 35 questions with known answers from the 2026/27 rulebook.
 
 For every question we measure two things separately:
   - retrieval: did one of the top 5 chunks contain the sentence that answers it?
-  - answer:    does the final answer contain the right key words (and none of the wrong ones)?
+  - answer:    does the final answer contain the right phrases (and none of the wrong ones)?
+  - judge:     a second opinion from the LLM, which compares the answer with the rulebook passage
+
+It also prints the highest reranker score of the off-topic questions, to check MIN_SCORE.
 
 Keyword grading is rough, so results/answers_<strategy>.md lists every answer for a human check.
 
@@ -15,7 +18,13 @@ import sys
 import time
 from pathlib import Path
 
-from rag import RulesAssistant, load_pages, normalize
+from rag import MIN_SCORE, RulesAssistant, load_pages, normalize
+
+# Specific phrases instead of loose words like "not" (almost any negative sentence contains "not",
+# so a wrong answer could still pass).
+NO_OFFSIDE = ["no offside", "not an offside", "not offside", "not be penalised", "not penalised",
+              "not be penalized", "not penalized", "no offence", "is not an offence", "cannot be offside"]
+OFFSIDE_YES = ["is an offside offence", "is penalised for offside", "is penalized for offside", "yes, it is offside"]
 
 # (question, needle: text in the rulebook that answers it, keywords: any must appear, forbidden: none may appear)
 FACTS = [
@@ -27,10 +36,11 @@ FACTS = [
     ("How far is the penalty mark from the goal line?", "11 m", ["11"], []),
     ("How wide is the goal?", "7.32", ["7.32"], []),
     ("How high is the crossbar?", "2.44", ["2.44"], []),
-    ("Can a goal be scored directly from a throw-in?", "a goal cannot be scored directly from a throw-in", ["cannot", "not"], []),
+    ("Can a goal be scored directly from a throw-in?", "a goal cannot be scored directly from a throw-in",
+     ["cannot be scored", "can't be scored", "cannot score", "not be scored", "no goal can be scored", "not allowed"], ["can be scored directly from a throw-in"]),
     ("Can a goal be scored directly from a goal kick?", "a goal may be scored directly from a goal kick", ["yes", "may be scored", "can score", "can be scored"], ["cannot", "can't", "not be scored"]),
-    ("Is there an offside offence if a player receives the ball directly from a throw-in?", "no offside offence if a player receives the ball directly from", ["not", "no offside", "no offence"], []),
-    ("Is there an offside offence if a player receives the ball directly from a corner kick?", "no offside offence if a player receives the ball directly from", ["not", "no offside", "no offence"], []),
+    ("Is there an offside offence if a player receives the ball directly from a throw-in?", "no offside offence if a player receives the ball directly from", NO_OFFSIDE, OFFSIDE_YES),
+    ("Is there an offside offence if a player receives the ball directly from a corner kick?", "no offside offence if a player receives the ball directly from", NO_OFFSIDE, OFFSIDE_YES),
     ("How far must opponents be from the ball at a free kick?", "9.15 m", ["9.15"], []),
     ("What colour card does the referee show for a caution?", "the yellow card communicates a caution", ["yellow"], []),
     ("What colour card is shown when a player is sent off?", "the red card communicates a sending-off", ["red"], []),
@@ -41,13 +51,23 @@ FACTS = [
     ("What is the capital of France?", None, None, []),
 ]
 
+# Harder off-topic questions: they ARE about football (so they look close to the rulebook),
+# but the rulebook can't answer them. These check that MIN_SCORE still refuses.
+OFF_TOPIC_FOOTBALL = [
+    ("Who is the best referee in the Premier League?", None, None, []),
+    ("Which club has won the most Champions League titles?", None, None, []),
+    ("How much money does a Premier League referee earn?", None, None, []),
+    ("Who refereed the 2022 World Cup final?", None, None, []),
+    ("What formation should my team play against a 4-3-3?", None, None, []),
+]
+
 SITUATIONS = [
     ("A defender deliberately handles the ball on the goal line and stops a certain goal. What is the sanction?",
      "by committing a deliberate handball offence", ["sent off", "sending-off", "sending off", "red card"], []),
     ("A defender fouls an attacker in the penalty area while trying to play the ball, denying an obvious goal-scoring opportunity. What card is shown?",
      "attempt to play the ball or a challenge for the ball and the referee awards a penalty kick", ["caution", "yellow"], ["is sent off", "be sent off", "red card is shown"]),
     ("Is a player penalised for offside if they receive the ball directly from a goal kick?",
-     "no offside offence if a player receives the ball directly from", ["not", "no offside", "no offence"], []),
+     "no offside offence if a player receives the ball directly from", NO_OFFSIDE, OFFSIDE_YES),
     ("What happens if a player scores directly from an indirect free kick into the opponents' goal?",
      "if an indirect free kick is kicked directly into the opponents' goal, a goal kick is awarded", ["goal kick"], []),
     ("The ball hits the referee and goes into the goal. What happens?",
@@ -64,7 +84,8 @@ SITUATIONS = [
      "receiving a second caution in the same match", ["sent off", "sending-off", "sending off", "red"], []),
 ]
 
-TESTS = [("fact", *t) for t in FACTS] + [("situation", *t) for t in SITUATIONS]
+TESTS = ([("fact", *t) for t in FACTS] + [("situation", *t) for t in SITUATIONS]
+         + [("off_topic", *t) for t in OFF_TOPIC_FOOTBALL])
 RESULTS = Path(__file__).parent / "results"
 
 
@@ -88,6 +109,27 @@ def grade_answer(answer, keywords, forbidden):
     return any(k in a for k in keywords) and not any(f in a for f in forbidden)
 
 
+JUDGE_PROMPT = (
+    "You are grading a football rules assistant. Compare the ANSWER with the RULEBOOK passage. "
+    "Reply with exactly one word: CORRECT if the answer agrees with the rulebook and answers the question, "
+    "otherwise WRONG."
+)
+
+
+def judge_answer(assistant, question, needle, answer, sources):
+    """LLM-as-judge: a second opinion next to keyword grading. Uses the same local LLM,
+    and shows it the rulebook text around the needle so it grades against the real rule."""
+    if needle is None or assistant.llm is None:
+        return None
+    reference = next((h["text"] for h in sources if clean(needle) in clean(h["text"])), needle)
+    messages = [
+        {"role": "system", "content": JUDGE_PROMPT},
+        {"role": "user", "content": f"QUESTION: {question}\n\nRULEBOOK: {reference}\n\nANSWER: {answer}"},
+    ]
+    verdict = assistant.llm(messages, max_new_tokens=4, do_sample=False)[0]["generated_text"][-1]["content"]
+    return verdict.strip().upper().startswith("CORRECT")
+
+
 def evaluate(strategy):
     assistant = RulesAssistant(strategy=strategy)
     rows = []
@@ -98,27 +140,41 @@ def evaluate(strategy):
         rows.append({
             "kind": kind,
             "question": question,
+            "needle": needle,
             "answer": result["answer"],
             "pages": [h["page"] for h in result["sources"]],
             "top_score": round(result["sources"][0]["score"], 2) if result["sources"] else None,
             "retrieval_hit": None if needle is None else clean(needle) in retrieved,
             "answer_correct": grade_answer(result["answer"], keywords, forbidden),
+            "judge_correct": judge_answer(assistant, question, needle, result["answer"], result["sources"]),
             "seconds": round(time.time() - start, 1),
         })
         mark = "OK " if rows[-1]["answer_correct"] else "BAD"
-        print(f"[{strategy}] {mark} {question[:70]}")
+        judge = {True: "judge:OK ", False: "judge:BAD", None: ""}[rows[-1]["judge_correct"]]
+        print(f"[{strategy}] {mark} {judge} score={rows[-1]['top_score']} {question[:60]}")
     return rows
 
 
 def summarize(rows):
     out = {}
-    for kind in ("fact", "situation"):
+    for kind in ("fact", "situation", "off_topic"):
         part = [r for r in rows if r["kind"] == kind]
         with_needle = [r for r in part if r["retrieval_hit"] is not None]
-        out[kind] = {
-            "answers": f"{sum(r['answer_correct'] for r in part)}/{len(part)}",
-            "retrieval": f"{sum(r['retrieval_hit'] for r in with_needle)}/{len(with_needle)}",
-        }
+        judged = [r for r in part if r["judge_correct"] is not None]
+        out[kind] = {"answers": f"{sum(r['answer_correct'] for r in part)}/{len(part)}"}
+        if with_needle:
+            out[kind]["retrieval"] = f"{sum(r['retrieval_hit'] for r in with_needle)}/{len(with_needle)}"
+        if judged:
+            out[kind]["llm_judge"] = f"{sum(r['judge_correct'] for r in judged)}/{len(judged)}"
+        # keyword grade and judge disagree -> worth a manual look
+        out[kind]["disagreements"] = [r["question"] for r in judged if r["judge_correct"] != r["answer_correct"]]
+    refusals = [r["top_score"] for r in rows if r["needle"] is None]
+    answerable = [r["top_score"] for r in rows if r["needle"] is not None]
+    out["threshold_check"] = {
+        "MIN_SCORE": MIN_SCORE,
+        "highest_off_topic_score": max(refusals) if refusals else None,
+        "lowest_answerable_score": min(answerable) if answerable else None,
+    }
     return out
 
 
@@ -129,9 +185,10 @@ def write_report(strategy, rows):
     for r in rows:
         mark = "✅" if r["answer_correct"] else "❌"
         hit = {True: "found", False: "missed", None: "n/a"}[r["retrieval_hit"]]
+        judge = {True: "judge ✅", False: "judge ❌", None: "judge n/a"}[r["judge_correct"]]
         lines.append(f"### {mark} {r['question']}\n")
         lines.append(f"{r['answer']}\n")
-        lines.append(f"*Pages: {r['pages']} · top score {r['top_score']} · answer passage {hit}*\n")
+        lines.append(f"*Pages: {r['pages']} · top score {r['top_score']} · answer passage {hit} · {judge}*\n")
     (RESULTS / f"answers_{strategy}.md").write_text("\n".join(lines))
 
 

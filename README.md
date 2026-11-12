@@ -58,13 +58,46 @@ rules questions).
   the answer actually said *no* (it's yes, against the opposing team, Law 16). The score above is the corrected one and
   the grader is now stricter. Lesson: check the answers, not just the score.
 
+## Updates after code review (Nov 2026)
+
+A mentor reviewed the project and pointed out three weak spots. Here's what changed:
+
+1. **The index now rebuilds when the chunking changes.** Before, the ChromaDB index was only built when the collection
+   was empty, so after editing the chunking code the *old* chunks in `.chroma/` were silently reused. Each collection
+   name now includes a hash of the chunker's code, its settings and the embedding model (e.g. `laws_section_5a1c446c`),
+   so any change builds a fresh index and outdated ones are deleted.
+2. **Stricter answer grading, plus an LLM judge.** Loose keywords like "not" were removed (almost any negative sentence
+   contains "not", so a wrong answer could pass). Questions now need specific phrases such as "no offside offence" or
+   "cannot be scored", with forbidden phrases for the opposite ruling. `eval.py` also asks the LLM to compare each
+   answer with the rulebook passage (LLM-as-judge) and lists every question where the judge and the keyword check
+   disagree, for a manual look.
+3. **Harder off-topic tests for the refusal threshold.** `MIN_SCORE` was chosen from only two off-topic questions, so I
+   added five football questions the rulebook can't answer. Top reranker scores:
+
+   | Question | Fixed | Section |
+   |---|---|---|
+   | Who refereed the 2022 World Cup final? | **+1.47** | **+1.34** |
+   | Who is the best referee in the Premier League? | −3.54 | −4.69 |
+   | What formation should my team play against a 4-3-3? | −7.40 | −6.74 |
+   | How much money does a Premier League referee earn? | −8.69 | −9.78 |
+   | Which club has won the most Champions League titles? | −10.63 | −10.72 |
+   | *Lowest score of a real rules question* | *+0.34* | *+3.07* |
+
+   **Finding:** the threshold alone is not enough. "Who refereed the 2022 World Cup final?" scores *above* `MIN_SCORE = 0`
+   (it reads a lot like the referee sections of the rulebook), and with fixed chunks it even beats a real question
+   (+0.34), so no single cut-off separates them. Such questions fall through to the second safety net: the system
+   prompt tells the LLM to refuse when the excerpts don't contain the answer. `eval.py` now reports the highest
+   off-topic score and the lowest answerable score on every run, so this gap is tracked instead of assumed.
+
+The results table above is from the Nov 10 Colab run. Re-run `eval.py` to get scores with the stricter grader.
+
 ## Run it
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python app.py          # chat app at http://127.0.0.1:7860 (downloads the rulebook and models on first run)
-python eval.py         # runs the 30-question test for both chunking strategies
+python eval.py         # runs the 35-question test for both chunking strategies
 ```
 
 - `PREVIEW=1 python app.py` starts the app without the LLM (it shows the best-matching rule), which is handy on slow machines.
@@ -76,7 +109,7 @@ python eval.py         # runs the 30-question test for both chunking strategies
 | File | What it does |
 |---|---|
 | `rag.py` | The pipeline: PDF loading, both chunking strategies, ChromaDB index, retrieval and reranking, answer generation |
-| `eval.py` | The 30-question test, with a retrieval check and an answer check per question |
+| `eval.py` | The 35-question test: retrieval check, phrase-based answer check, LLM-as-judge, and a refusal-threshold check |
 | `app.py` | Gradio chat app (custom dark design made in Figma) |
 | `results/` | Test scores |
 

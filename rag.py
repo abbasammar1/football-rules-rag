@@ -4,6 +4,9 @@ Pipeline: load PDF -> chunk -> embed (bge-base) -> store (ChromaDB)
           -> retrieve top 20 -> rerank (cross-encoder) -> generate (Qwen2.5-3B).
 """
 
+import hashlib
+import inspect
+import json
 import os
 import re
 import urllib.request
@@ -150,6 +153,23 @@ def chunk_by_section(pages, size=120, step=90):
 
 CHUNKERS = {"fixed": chunk_fixed, "section": chunk_by_section}
 
+# Bump this by hand if you change anything else that affects the stored chunks.
+INDEX_VERSION = 2
+
+
+def index_name(strategy):
+    """Collection name that changes whenever the chunking changes.
+
+    It hashes the chunker's source code (including its default size/step), the embedding
+    model and INDEX_VERSION. Editing chunk_fixed / chunk_by_section, or switching models,
+    gives a new name, so a fresh index is built instead of silently reusing old chunks.
+    """
+    funcs = [CHUNKERS[strategy]] + ([section_label] if strategy == "section" else [])
+    fingerprint = "".join(inspect.getsource(f) for f in funcs) + EMBED_MODEL + str(INDEX_VERSION)
+    if strategy == "section":
+        fingerprint += SUBHEADING.pattern + json.dumps(LAW_TITLES)
+    return f"laws_{strategy}_{hashlib.sha1(fingerprint.encode()).hexdigest()[:8]}"
+
 
 # ---------------------------------------------------------------- the assistant
 
@@ -171,8 +191,15 @@ class RulesAssistant:
 
     def _build_index(self, strategy):
         client = chromadb.PersistentClient(path=str(DB_PATH))
-        collection = client.get_or_create_collection(f"laws_{strategy}", metadata={"hnsw:space": "cosine"})
+        name = index_name(strategy)
+        # Delete outdated indexes for this strategy so .chroma/ doesn't keep growing.
+        for old in client.list_collections():
+            old_name = old if isinstance(old, str) else old.name
+            if old_name.startswith(f"laws_{strategy}") and old_name != name:
+                client.delete_collection(old_name)
+        collection = client.get_or_create_collection(name, metadata={"hnsw:space": "cosine"})
         if collection.count() == 0:
+            print(f"Building index {name} ...")
             chunks = CHUNKERS[strategy](load_pages())
             texts = [c["text"] for c in chunks]
             collection.add(
